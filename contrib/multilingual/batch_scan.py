@@ -228,7 +228,7 @@ def main() -> None:
         metavar="N",
         help="Number of parallel scan workers (default: 4).  "
         "Reduce to 1 for free-tier API keys, increase for enterprise tiers.  "
-        "Skills that time out (300s) or crash (event loop) are retried once.",
+        "Skills that time out (90s) are skipped; other workers continue.",
     )
     parser.add_argument(
         "-V",
@@ -328,36 +328,28 @@ def main() -> None:
             idx = future_map[future]
             rel_name = str(skill_dirs[idx - 1].relative_to(root)) if idx <= len(skill_dirs) else "?"
             try:
-                entry, error_msg, rel_name = future.result(timeout=300)
+                entry, error_msg, rel_name = future.result(timeout=90)
             except TimeoutError:
                 errors += 1
                 with _print_lock:
                     _print(
                         f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]TIMEOUT (300s)[/red]"
+                        f"[red]TIMEOUT (90s)[/red]"
+                    )
+                # Don't retry — the worker thread is still stuck and a
+                # retry would consume another slot.  HTTP-level timeouts
+                # (runner.py Patch 6) prevent most hangs from happening.
+                continue
+            except Exception:
+                # Unexpected crash (e.g. asyncio event-loop failure).
+                # Don't retry — log and continue.
+                errors += 1
+                with _print_lock:
+                    _print(
+                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
+                        f"[red]CRASH[/red]"
                     )
                 continue
-            except RuntimeError:
-                # Event-loop-closed crash from asyncio.run() in the graph.
-                # Retry once — the second attempt gets a fresh thread + loop.
-                try:
-                    new_future = executor.submit(
-                        _scan_skill,
-                        skill_dirs[idx - 1],
-                        root,
-                        use_llm=use_llm,
-                        lang=lang_map[skill_dirs[idx - 1]],
-                        require_llm=args.require_llm,
-                    )
-                    entry, error_msg, rel_name = new_future.result(timeout=300)
-                except Exception:
-                    errors += 1
-                    with _print_lock:
-                        _print(
-                            f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                            f"[red]CRASH (event loop)[/red]"
-                        )
-                    continue
             lang = lang_map[skill_dirs[idx - 1]]
             results.append(entry)
 

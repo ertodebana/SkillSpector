@@ -348,7 +348,7 @@ class PooledChatModel:
         pool: ApiKeyPool,
         *,
         max_tokens: int = 4096,
-        timeout: float = 120.0,
+        timeout: float = 30.0,
         max_retries: int = _MAX_RATE_LIMIT_RETRIES,
     ) -> None:
         self._pool = pool
@@ -463,16 +463,28 @@ class PooledChatModel:
         ) from last_exception
 
     def _build_llm(self, key: ApiKey):
-        """Build a fresh :class:`~langchain_openai.ChatOpenAI` for *key*."""
+        """Build a fresh :class:`~langchain_openai.ChatOpenAI` for *key*.
+
+        Uses :class:`httpx.Timeout` so ``connect`` and ``read`` deadlines
+        are independent — a hung server that accepts the TCP handshake but
+        never sends a response byte is cut off at ``connect + timeout``
+        instead of blocking the worker thread forever.
+        """
         from langchain_openai import ChatOpenAI
         from pydantic import SecretStr
+
+        try:
+            import httpx
+            _timeout = httpx.Timeout(self._timeout, connect=8.0)
+        except ImportError:
+            _timeout = self._timeout
 
         return ChatOpenAI(
             model=key.model,
             base_url=key.base_url,
             api_key=SecretStr(key.key),
             max_completion_tokens=self._max_tokens,
-            timeout=self._timeout,
+            timeout=_timeout,
         )
 
     @staticmethod

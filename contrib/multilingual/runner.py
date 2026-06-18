@@ -3,17 +3,204 @@
 Thin wrappers over ``skillspector.graph.graph`` — build initial state,
 invoke the graph, and transform the raw result dict into a structured
 batch entry suitable for downstream reporting.
+
+Thread-safety note
+------------------
+The module-level patches below run at import time (before any threads
+start).  They inject ``response_schema = None`` as an *instance attribute*
+inside ``__init__``, which Python MRO resolves before the class-level
+``response_schema``.  Each analyzer instance gets its own ``None`` in
+``self.__dict__`` — no shared state, no race.
+
+The ``parse_response`` patches handle raw-string responses (JSON parsed
+manually) so that providers without structured-output support (e.g.
+DeepSeek direct API) work correctly.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
 from skillspector.graph import graph
+from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult
+from skillspector.logging_config import get_logger
+from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
+
+logger = get_logger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP timeout — stop hung connections from blocking workers forever
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_REQUEST_TIMEOUT = 30.0  # total request ceiling
+_DEFAULT_CONNECT_TIMEOUT = 8.0   # TCP / TLS handshake
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Module-level patches (import time — before any thread starts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# -- Patch 1: inject response_schema=None as instance attribute ------------
+_original_base_init = LLMAnalyzerBase.__init__
+
+
+def _patched_base_init(self, base_prompt, model):
+    """Set response_schema=None on the instance dict BEFORE original init.
+
+    Python MRO finds the instance attribute first, so the class-level
+    ``response_schema = LLMAnalysisResult`` is never reached.  Each
+    instance has its own ``None`` — no shared mutable state.
+    """
+    self.response_schema = None
+    _original_base_init(self, base_prompt, model)
+
+
+LLMAnalyzerBase.__init__ = _patched_base_init
+
+
+# -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------
+_original_base_parse = LLMAnalyzerBase.parse_response
+
+
+def _patched_base_parse(self, response, batch):
+    """Parse raw LLM text into Findings via manual JSON + Pydantic."""
+    if isinstance(response, LLMAnalysisResult):
+        return _original_base_parse(self, response, batch)
+    text = _strip_markdown_fences(str(response))
+    try:
+        data = json.loads(text)
+        result = LLMAnalysisResult.model_validate(data)
+        return [f.to_finding(batch.file_path) for f in result.findings]
+    except (json.JSONDecodeError, Exception) as exc:
+        logger.warning(
+            "LLMAnalyzerBase.parse_response: invalid JSON for %s: %s",
+            batch.file_label,
+            exc,
+        )
+        return []
+
+
+LLMAnalyzerBase.parse_response = _patched_base_parse
+
+
+# -- Patch 3: LLMMetaAnalyzer.parse_response handles raw JSON ---------------
+_original_meta_parse = LLMMetaAnalyzer.parse_response
+
+
+def _patched_meta_parse(self, response, batch):
+    """Parse raw LLM text into meta-analyzer dicts via manual JSON + Pydantic."""
+    if isinstance(response, MetaAnalyzerResult):
+        return _original_meta_parse(self, response, batch)
+    text = _strip_markdown_fences(str(response))
+    try:
+        data = json.loads(text)
+        result = MetaAnalyzerResult.model_validate(data)
+        items = []
+        for f in result.findings:
+            d = f.model_dump()
+            d["_file"] = batch.file_path
+            items.append(d)
+        return items
+    except (json.JSONDecodeError, Exception) as exc:
+        logger.warning(
+            "LLMMetaAnalyzer.parse_response: invalid JSON for %s: %s",
+            batch.file_label,
+            exc,
+        )
+        return []
+
+
+LLMMetaAnalyzer.parse_response = _patched_meta_parse
+
+
+# -- Patch 4: append JSON output format to base prompt ---------------------
+# Without with_structured_output(), the LLM receives no JSON format
+# instruction.  We append it so the model responds with parseable JSON
+# instead of natural language.
+_JSON_OUTPUT_INSTRUCTION = (
+    "\n\nRespond with ONLY a JSON object (no markdown, no explanation):\n"
+    '{"findings": [{"rule_id": "...", "message": "...", '
+    '"severity": "LOW|MEDIUM|HIGH|CRITICAL", "start_line": 1, '
+    '"end_line": null, "confidence": 0.0-1.0, '
+    '"explanation": "...", "remediation": "..."}]}\n'
+    "If no issues found, return: {\"findings\": []}"
+)
+
+_original_base_build_prompt = LLMAnalyzerBase.build_prompt
+
+
+def _patched_base_build_prompt(self, batch, **kwargs):
+    prompt = _original_base_build_prompt(self, batch, **kwargs)
+    return prompt + _JSON_OUTPUT_INSTRUCTION
+
+
+LLMAnalyzerBase.build_prompt = _patched_base_build_prompt
+
+
+# -- Patch 5: append JSON format to meta-analyzer prompt -----------------------
+_original_meta_build_prompt = LLMMetaAnalyzer.build_prompt
+
+
+def _patched_meta_build_prompt(self, batch, **kwargs):
+    prompt = _original_meta_build_prompt(self, batch, **kwargs)
+    return prompt + (
+        "\n\nRespond with ONLY a JSON object (no markdown):\n"
+        '{"findings": [{"pattern_id": "...", "is_vulnerability": true|false, '
+        '"confidence": 0.0-1.0, "intent": "malicious|negligent|benign", '
+        '"impact": "critical|high|medium|low", '
+        '"explanation": "...", "remediation": "..."}], '
+        '"overall_assessment": {"risk_level": "LOW|MEDIUM|HIGH|CRITICAL", '
+        '"summary": "..."}}\n'
+        'If no findings: {"findings": [], '
+        '"overall_assessment": {"risk_level": "LOW", "summary": "No issues found"}}'
+    )
+
+
+LLMMetaAnalyzer.build_prompt = _patched_meta_build_prompt
+
+
+# -- Patch 6: enforce HTTP-level timeouts on all ChatOpenAI instances ------
+# ChatOpenAI stores timeout internally and caches the OpenAI client inside
+# __init__.  Patching after __init__ (e.g. via get_chat_model) is too late
+# — the cached client keeps the original timeout.  Instead we inject the
+# timeout via __init__ kwargs so it flows into every root_client / async_client
+# from the start.
+try:
+    import httpx
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+
+    _original_chatopenai_init = _ChatOpenAI.__init__
+
+    def _patched_chatopenai_init(self, **kwargs):
+        # ``timeout`` is the Pydantic alias for ``request_timeout``.
+        # When both keys are present, Pydantic v2 prefers the alias,
+        # so we must overwrite the alias — not the canonical name.
+        kwargs["timeout"] = httpx.Timeout(
+            _DEFAULT_REQUEST_TIMEOUT,
+            connect=_DEFAULT_CONNECT_TIMEOUT,
+        )
+        _original_chatopenai_init(self, **kwargs)
+
+    _ChatOpenAI.__init__ = _patched_chatopenai_init
+except ImportError:
+    pass
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove ```json ... ``` wrappers from LLM output."""
+    text = text.strip()
+    if text.startswith("```"):
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3].rstrip()
+    return text.strip()
 
 
 def scan_state(skill_dir: Path, use_llm: bool) -> dict[str, object]:
@@ -26,10 +213,26 @@ def scan_state(skill_dir: Path, use_llm: bool) -> dict[str, object]:
 
 
 def cleanup_result(result: dict[str, object]) -> None:
-    """Remove the temporary directory created by the graph, if any."""
+    """Remove the temporary directory created by the graph, if any.
+
+    Uses ``shutil.rmtree`` first.  Falls back to ``subprocess`` with a
+    10-second timeout when the tree contains dangling file handles (e.g.
+    stale asyncio HTTP connections after a provider error).
+    """
     temp_dir = result.get("temp_dir_for_cleanup")
-    if temp_dir and isinstance(temp_dir, str):
+    if not temp_dir or not isinstance(temp_dir, str):
+        return
+    try:
         shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        try:
+            subprocess.run(
+                ["rm", "-rf", temp_dir],
+                timeout=10,
+                capture_output=True,
+            )
+        except Exception:
+            pass
 
 
 # Number of English-keyword static rules that lose recall for non-English skills.
@@ -165,16 +368,6 @@ def run_one(
     *error_message* carries the exception text.
     """
     result = None
-    # Disable structured output for graph-internal LLM calls.  DeepSeek
-    # and some providers don't support response_format; requesting it
-    # causes a 400 that corrupts the HTTP connection pool.  Both the
-    # base class and the meta-analyzer subclass set their own schema.
-    from skillspector.llm_analyzer_base import LLMAnalyzerBase as _Base
-    from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer as _Meta
-    _saved_base = _Base.response_schema
-    _saved_meta = _Meta.response_schema
-    _Base.response_schema = None
-    _Meta.response_schema = None
     try:
         state = scan_state(skill_dir, use_llm=use_llm)
         result = graph.invoke(state)
@@ -214,8 +407,6 @@ def run_one(
         }
         return error_entry, str(exc)
     finally:
-        _Base.response_schema = _saved_base
-        _Meta.response_schema = _saved_meta
         if result is not None:
             cleanup_result(result)
 
