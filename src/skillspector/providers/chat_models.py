@@ -45,8 +45,7 @@ def validate_base_url(url: str | None) -> None:
         )
     if not parsed.netloc:
         logger.warning(
-            "Provider base_url %r has no host component. "
-            "Requests will likely fail.",
+            "Provider base_url %r has no host component. Requests will likely fail.",
             url,
         )
 
